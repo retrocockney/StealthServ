@@ -1,342 +1,559 @@
 
 const http = require('http');
-const { WebSocketServer } = require('ws');
+const WebSocket = require('ws');
 const crypto = require('crypto');
 
-const PORT = process.env.PORT || 10000;
+const PORT = process.env.PORT || 3000;
+
 const WIN_KILLS = 10;
 const FFA_MAX = 8;
-
-const rooms = new Map();
-const queues = { duel: [], ffa: [] };
+const SPAWN_RADIUS = 58;
+const RESPAWN_DELAY = 2500;
+const FFA_WAIT = 8000;
 
 const server = http.createServer((req, res) => {
-  res.writeHead(200, {
-    'content-type': 'application/json',
-    'access-control-allow-origin': '*'
-  });
-
-  res.end(JSON.stringify({
-    name: 'STEALTH multiplayer server',
-    status: 'online',
-    modes: ['duel', 'ffa'],
-    ffaMax: FFA_MAX,
-    winKills: WIN_KILLS,
-    bots: false
-  }));
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('STEALTH multiplayer server online');
 });
 
-const wss = new WebSocketServer({ server });
+const wss = new WebSocket.Server({ server });
+
+const rooms = new Map();
+const queues = {
+  duel: [],
+  ffa: []
+};
+
+let ffaTimer = null;
 
 function send(ws, data) {
-  if (ws && ws.readyState === 1) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify(data));
   }
 }
 
 function broadcast(room, data) {
-  for (const p of room.players.values()) {
-    send(p.ws, data);
+  for (const player of room.players) {
+    send(player.ws, data);
   }
 }
 
-function publicPlayers(room) {
-  return [...room.players.values()].map(p => ({
-    id: p.id,
-    x: p.x,
-    y: p.y,
-    z: p.z,
-    yaw: p.yaw,
-    hp: p.hp,
-    kills: p.kills,
-    dead: p.dead
-  }));
+function makeId() {
+  return crypto.randomBytes(8).toString('hex');
 }
 
-function roomState(room) {
-  return {
-    type: 'state',
-    roomId: room.id,
-    mode: room.mode,
-    players: publicPlayers(room),
-    target: WIN_KILLS
-  };
-}
+function getSpawn(mode, index, total) {
+  if (mode === 'duel') {
+    const x = index === 0 ? -SPAWN_RADIUS : SPAWN_RADIUS;
 
-function createRoom(mode, clients) {
-  const room = {
-    id: crypto.randomUUID().slice(0, 8).toUpperCase(),
-    mode,
-    players: new Map(),
-    ended: false
-  };
-
-  rooms.set(room.id, room);
-
-  clients.forEach((ws, i) => {
-    const id = crypto.randomUUID();
-
-    const x = mode === 'duel'
-      ? (i === 0 ? -8 : 8)
-      : Math.cos(i * Math.PI * 2 / clients.length) * 12;
-
-    const z = mode === 'duel'
-      ? 0
-      : Math.sin(i * Math.PI * 2 / clients.length) * 12;
-
-    const p = {
-      id,
-      ws,
+    return {
       x,
       y: 0,
-      z,
-      yaw: Math.atan2(-x, -z),
-      hp: 100,
-      kills: 0,
-      dead: false,
-      lastShot: 0,
-      respawnAt: 0
+      z: 0,
+      yaw: index === 0 ? Math.PI / 2 : -Math.PI / 2
     };
+  }
 
-    room.players.set(id, p);
+  const angle = (Math.PI * 2 * index / total) - Math.PI / 2;
 
-    ws.playerId = id;
-    ws.roomId = room.id;
-    ws.queued = false;
+  const x = Math.cos(angle) * SPAWN_RADIUS;
+  const z = Math.sin(angle) * SPAWN_RADIUS;
 
-    send(ws, {
-      type: 'matchFound',
-      id,
-      roomId: room.id,
-      mode,
+  return {
+    x,
+    y: 0,
+    z,
+    yaw: Math.atan2(-x, -z)
+  };
+}
+
+function getRespawn(room, player) {
+  const enemies = room.players.filter(p =>
+    p.id !== player.id && !p.dead
+  );
+
+  if (room.mode === 'duel') {
+    const enemy = enemies[0];
+
+    if (!enemy) {
+      return getSpawn('duel', player.spawnIndex, 2);
+    }
+
+    const x = enemy.x >= 0 ? -SPAWN_RADIUS : SPAWN_RADIUS;
+
+    return {
       x,
       y: 0,
-      z,
-      yaw: p.yaw,
-      target: WIN_KILLS,
-      maxPlayers: mode === 'ffa' ? FFA_MAX : 2
-    });
-  });
-
-  broadcast(room, roomState(room));
-}
-
-function startQueue(mode) {
-  const q = queues[mode];
-  const max = mode === 'duel' ? 2 : FFA_MAX;
-
-  while (q.length >= max) {
-    createRoom(mode, q.splice(0, max));
+      z: (Math.random() - 0.5) * 8,
+      yaw: Math.atan2(-enemy.x + x, -enemy.z)
+    };
   }
 
-  if (mode === 'ffa' && q.length >= 2) {
-    createRoom(mode, q.splice(0, max));
-  }
-}
+  let best = null;
+  let bestDistance = -1;
 
-function removeFromQueue(ws) {
-  for (const mode of ['duel', 'ffa']) {
-    queues[mode] = queues[mode].filter(player => player !== ws);
-  }
-  ws.queued = false;
-}
+  for (let i = 0; i < 48; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const x = Math.cos(angle) * SPAWN_RADIUS;
+    const z = Math.sin(angle) * SPAWN_RADIUS;
 
-function removePlayer(ws) {
-  removeFromQueue(ws);
+    let nearest = Infinity;
 
-  if (!ws.roomId) return;
+    for (const enemy of enemies) {
+      const distance = Math.hypot(
+        enemy.x - x,
+        enemy.z - z
+      );
 
-  const room = rooms.get(ws.roomId);
-  if (!room) return;
+      nearest = Math.min(nearest, distance);
+    }
 
-  room.players.delete(ws.playerId);
-
-  broadcast(room, {
-    type: 'playerLeft',
-    id: ws.playerId
-  });
-
-  if (room.players.size === 0) {
-    rooms.delete(room.id);
+    if (nearest > bestDistance) {
+      bestDistance = nearest;
+      best = { x, y: 0, z };
+    }
   }
 
-  ws.roomId = null;
-  ws.playerId = null;
+  if (!best) {
+    best = getSpawn('ffa', player.spawnIndex, room.players.length);
+  }
+
+  const enemy = enemies[0];
+
+  best.yaw = enemy
+    ? Math.atan2(-enemy.x + best.x, -enemy.z + best.z)
+    : 0;
+
+  return best;
 }
 
-function respawn(room, player) {
-  if (room.ended) return;
-
-  player.hp = 100;
-  player.dead = false;
-  player.x = Math.random() > 0.5 ? -10 : 10;
-  player.y = 0;
-  player.z = Math.random() * 10 - 5;
-
-  broadcast(room, {
-    type: 'respawn',
+function playerData(player) {
+  return {
     id: player.id,
+    name: player.name,
     x: player.x,
     y: player.y,
     z: player.z,
-    hp: player.hp
+    yaw: player.yaw,
+    hp: player.hp,
+    kills: player.kills,
+    dead: player.dead,
+    isBot: false
+  };
+}
+
+function sendState(room) {
+  broadcast(room, {
+    type: 'state',
+    players: room.players.map(playerData)
   });
 }
 
-function eliminate(room, victim, attacker, weapon) {
-  if (victim.dead || room.ended) return;
+function createRoom(mode, players) {
+  const room = {
+    id: makeId(),
+    mode,
+    players: [],
+    over: false
+  };
 
-  victim.hp = 0;
-  victim.dead = true;
+  players.forEach((ws, index) => {
+    const spawn = getSpawn(mode, index, players.length);
 
-  if (attacker) {
-    attacker.kills++;
+    const player = {
+      id: ws.playerId,
+      name: ws.playerName || 'PLAYER',
+      ws,
+      x: spawn.x,
+      y: spawn.y,
+      z: spawn.z,
+      yaw: spawn.yaw,
+      hp: 100,
+      kills: 0,
+      dead: false,
+      spawnIndex: index,
+      lastShot: 0
+    };
 
-    if (attacker.kills >= WIN_KILLS) {
-      room.ended = true;
+    player.roomId = room.id;
+    ws.roomId = room.id;
+    ws.queued = false;
 
-      broadcast(room, {
-        type: 'matchOver',
-        winner: attacker.id,
-        kills: attacker.kills
-      });
-      return;
+    room.players.push(player);
+  });
+
+  rooms.set(room.id, room);
+
+  for (const player of room.players) {
+    send(player.ws, {
+      type: 'matchFound',
+      id: player.id,
+      roomId: room.id,
+      mode,
+      x: player.x,
+      y: player.y,
+      z: player.z,
+      yaw: player.yaw
+    });
+  }
+
+  sendState(room);
+
+  console.log(
+    `Room ${room.id} started: ${mode}, ${room.players.length} real players`
+  );
+}
+
+function startDuelQueue() {
+  while (queues.duel.length >= 2) {
+    const players = queues.duel.splice(0, 2);
+    createRoom('duel', players);
+  }
+}
+
+function startFFAQueue() {
+  if (ffaTimer) {
+    clearTimeout(ffaTimer);
+    ffaTimer = null;
+  }
+
+  if (queues.ffa.length < 2) return;
+
+  const players = queues.ffa.splice(0, FFA_MAX);
+  createRoom('ffa', players);
+
+  if (queues.ffa.length >= 2) {
+    scheduleFFA();
+  }
+}
+
+function scheduleFFA() {
+  if (ffaTimer || queues.ffa.length < 2) return;
+
+  ffaTimer = setTimeout(() => {
+    ffaTimer = null;
+    startFFAQueue();
+  }, FFA_WAIT);
+}
+
+function removeFromQueues(ws) {
+  for (const mode of ['duel', 'ffa']) {
+    const index = queues[mode].indexOf(ws);
+
+    if (index !== -1) {
+      queues[mode].splice(index, 1);
     }
   }
 
-  broadcast(room, {
-    type: 'elimination',
-    victim: victim.id,
-    killer: attacker ? attacker.id : null,
-    weapon,
-    scores: publicPlayers(room).map(p => ({
-      id: p.id,
-      kills: p.kills
-    }))
-  });
-
-  setTimeout(() => {
-    if (rooms.has(room.id)) {
-      respawn(room, victim);
-    }
-  }, 2500);
+  ws.queued = false;
 }
 
-function damage(room, victim, attacker, weapon) {
-  if (victim.dead || room.ended) return;
+function joinQueue(ws, mode) {
+  if (mode !== 'duel' && mode !== 'ffa') {
+    send(ws, { type: 'error', message: 'Invalid game mode.' });
+    return;
+  }
 
-  const amount = weapon === 'sniper'
-    ? 100
-    : weapon === 'knife'
-      ? 50
-      : 34;
+  if (ws.roomId) {
+    send(ws, { type: 'error', message: 'You are already in a match.' });
+    return;
+  }
 
-  victim.hp = Math.max(0, victim.hp - amount);
+  removeFromQueues(ws);
+
+  ws.queued = true;
+  queues[mode].push(ws);
+
+  send(ws, {
+    type: 'queued',
+    mode,
+    message: 'Waiting for real players.'
+  });
+
+  if (mode === 'duel') {
+    startDuelQueue();
+  } else {
+    scheduleFFA();
+  }
+}
+
+function finishMatch(room, winner) {
+  if (room.over) return;
+
+  room.over = true;
+
+  broadcast(room, {
+    type: 'matchOver',
+    winner: winner ? winner.id : null
+  });
+
+  console.log(`Room ${room.id} finished`);
+
+  setTimeout(() => {
+    broadcast(room, { type: 'returnToMenu' });
+
+    for (const player of room.players) {
+      player.ws.roomId = null;
+    }
+
+    rooms.delete(room.id);
+  }, 6000);
+}
+
+function eliminate(room, attacker, victim) {
+  if (victim.dead || room.over) return;
+
+  victim.hp = 0;
+  victim.dead = true;
+  attacker.kills++;
 
   broadcast(room, {
     type: 'hit',
-    victim: victim.id,
     attacker: attacker.id,
+    target: victim.id,
     hp: victim.hp
   });
 
-  if (victim.hp <= 0) {
-    eliminate(room, victim, attacker, weapon);
+  broadcast(room, {
+    type: 'elimination',
+    killer: attacker.id,
+    victim: victim.id,
+    killerIsBot: false,
+    victimIsBot: false,
+    killerName: attacker.name,
+    victimName: victim.name
+  });
+
+  sendState(room);
+
+  if (attacker.kills >= WIN_KILLS) {
+    finishMatch(room, attacker);
+    return;
+  }
+
+  setTimeout(() => {
+    if (room.over || !room.players.includes(victim)) return;
+
+    const spawn = getRespawn(room, victim);
+
+    victim.x = spawn.x;
+    victim.y = spawn.y;
+    victim.z = spawn.z;
+    victim.yaw = spawn.yaw;
+    victim.hp = 100;
+    victim.dead = false;
+
+    send(victim.ws, {
+      type: 'respawn',
+      x: victim.x,
+      y: victim.y,
+      z: victim.z,
+      yaw: victim.yaw,
+      hp: victim.hp
+    });
+
+    sendState(room);
+  }, RESPAWN_DELAY);
+}
+
+function shoot(room, attacker, msg) {
+  if (room.over || attacker.dead) return;
+
+  const now = Date.now();
+
+  const weapon = msg.weapon || 'pistol';
+  const isKnife = weapon === 'knife';
+
+  const cooldown = isKnife ? 650 : 250;
+
+  if (now - attacker.lastShot < cooldown) return;
+  attacker.lastShot = now;
+
+  const origin = msg.origin;
+  const direction = msg.direction;
+
+  if (!origin || !direction) return;
+
+  let dx = Number(direction.x);
+  let dy = Number(direction.y);
+  let dz = Number(direction.z);
+
+  const length = Math.hypot(dx, dy, dz);
+
+  if (!Number.isFinite(length) || length < 0.001) return;
+
+  dx /= length;
+  dy /= length;
+  dz /= length;
+
+  const ox = Number(origin.x);
+  const oy = Number(origin.y);
+  const oz = Number(origin.z);
+
+  if (![ox, oy, oz].every(Number.isFinite)) return;
+
+  const range = isKnife ? 3.5 : 120;
+  const hitRadius = isKnife ? 1.4 : 0.75;
+
+  let closest = null;
+  let closestDistance = range;
+
+  for (const target of room.players) {
+    if (
+      target.id === attacker.id ||
+      target.dead
+    ) continue;
+
+    const tx = target.x - ox;
+    const ty = (target.y + 1.1) - oy;
+    const tz = target.z - oz;
+
+    const along = tx * dx + ty * dy + tz * dz;
+
+    if (along < 0 || along > range) continue;
+
+    const cx = ox + dx * along;
+    const cy = oy + dy * along;
+    const cz = oz + dz * along;
+
+    const distance = Math.hypot(
+      target.x - cx,
+      (target.y + 1.1) - cy,
+      target.z - cz
+    );
+
+    if (
+      distance <= hitRadius &&
+      along < closestDistance
+    ) {
+      closest = target;
+      closestDistance = along;
+    }
+  }
+
+  if (!closest) return;
+
+  const damage = isKnife ? 100 : weapon === 'sniper' ? 100 : 34;
+
+  closest.hp = Math.max(0, closest.hp - damage);
+
+  broadcast(room, {
+    type: 'hit',
+    attacker: attacker.id,
+    target: closest.id,
+    hp: closest.hp
+  });
+
+  if (closest.hp <= 0) {
+    eliminate(room, attacker, closest);
+  } else {
+    sendState(room);
+  }
+}
+
+function leaveRoom(ws) {
+  if (!ws.roomId) return;
+
+  const room = rooms.get(ws.roomId);
+  ws.roomId = null;
+
+  if (!room) return;
+
+  room.players = room.players.filter(p => p.ws !== ws);
+
+  if (room.players.length === 0) {
+    rooms.delete(room.id);
+  } else if (room.players.length === 1 && !room.over) {
+    const remaining = room.players[0];
+
+    finishMatch(room, remaining);
+  } else {
+    sendState(room);
   }
 }
 
 wss.on('connection', ws => {
-  send(ws, { type: 'hello', status: 'connected' });
+  ws.playerId = makeId();
+  ws.playerName = 'PLAYER';
+  ws.roomId = null;
+  ws.queued = false;
+
+  send(ws, {
+    type: 'hello',
+    id: ws.playerId
+  });
 
   ws.on('message', raw => {
     let msg;
 
     try {
-      msg = JSON.parse(raw);
+      msg = JSON.parse(raw.toString());
     } catch {
       return;
     }
 
+    if (!msg || typeof msg.type !== 'string') return;
+
     if (msg.type === 'join') {
-      const mode = msg.mode === 'ffa' ? 'ffa' : 'duel';
+      if (typeof msg.name === 'string') {
+        ws.playerName = msg.name.slice(0, 16);
+      }
 
-      removePlayer(ws);
-
-      if (mode === 'duel' && queues.duel.includes(ws)) return;
-      if (mode === 'ffa' && queues.ffa.includes(ws)) return;
-
-      ws.queued = true;
-      ws.mode = mode;
-
-      queues[mode].push(ws);
-
-      send(ws, {
-        type: 'queued',
-        mode,
-        playersWaiting: queues[mode].length,
-        bots: false
-      });
-
-      startQueue(mode);
+      joinQueue(ws, msg.mode);
+      return;
     }
 
     if (msg.type === 'leaveQueue') {
-      removeFromQueue(ws);
+      removeFromQueues(ws);
       send(ws, { type: 'returnToMenu' });
+      return;
     }
 
-    if (msg.type === 'move' && ws.roomId) {
-      const room = rooms.get(ws.roomId);
-      const player = room?.players.get(ws.playerId);
+    const room = rooms.get(ws.roomId);
+    if (!room || room.over) return;
 
-      if (!player || player.dead || room.ended) return;
+    const player = room.players.find(p => p.ws === ws);
+    if (!player) return;
 
-      player.x = Number(msg.x) || 0;
-      player.y = Number(msg.y) || 0;
-      player.z = Number(msg.z) || 0;
-      player.yaw = Number(msg.yaw) || 0;
+    if (msg.type === 'move') {
+      const x = Number(msg.x);
+      const y = Number(msg.y);
+      const z = Number(msg.z);
+      const yaw = Number(msg.yaw);
 
-      broadcast(room, {
-        type: 'playerMoved',
-        id: player.id,
-        x: player.x,
-        y: player.y,
-        z: player.z,
-        yaw: player.yaw
-      });
+      if (![x, y, z, yaw].every(Number.isFinite)) return;
+
+      player.x = Math.max(-72, Math.min(72, x));
+      player.y = Math.max(-10, Math.min(20, y));
+      player.z = Math.max(-72, Math.min(72, z));
+      player.yaw = yaw;
+
+      return;
     }
 
-    if (msg.type === 'shoot' && ws.roomId) {
-      const room = rooms.get(ws.roomId);
-      const attacker = room?.players.get(ws.playerId);
-
-      if (!attacker || attacker.dead || room.ended) return;
-
-      const now = Date.now();
-      if (now - attacker.lastShot < 200) return;
-      attacker.lastShot = now;
-
-      const victim = room.players.get(msg.target);
-
-      if (!victim || victim.id === attacker.id || victim.dead) return;
-
-      const weapon = ['sniper', 'knife', 'pistol'].includes(msg.weapon)
-        ? msg.weapon
-        : 'pistol';
-
-      damage(room, victim, attacker, weapon);
+    if (msg.type === 'shoot') {
+      shoot(room, player, msg);
+      return;
     }
   });
 
   ws.on('close', () => {
-    removePlayer(ws);
+    removeFromQueues(ws);
+    leaveRoom(ws);
   });
 
   ws.on('error', () => {
-    removePlayer(ws);
+    removeFromQueues(ws);
+    leaveRoom(ws);
   });
 });
 
-server.listen(PORT, () => {
+setInterval(() => {
+  for (const room of rooms.values()) {
+    if (!room.over) sendState(room);
+  }
+}, 100);
+
+server.listen(PORT, '0.0.0.0', () => {
   console.log(`STEALTH server running on port ${PORT}`);
 });
