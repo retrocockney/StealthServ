@@ -1,4 +1,3 @@
-
 const http = require('http');
 const WebSocket = require('ws');
 const crypto = require('crypto');
@@ -11,12 +10,33 @@ const SPAWN_RADIUS = 58;
 const RESPAWN_DELAY = 2500;
 const FFA_WAIT = 8000;
 
+// Look limits: clothes colour must be #rrggbb or "camo"; face must be a small JPEG/PNG data URL.
+const MAX_FACE_CHARS = 140000; // about 100 KB of base64
+const HEX_COLOUR = /^#[0-9a-fA-F]{6}$/;
+const FACE_PREFIX = /^data:image\/(jpeg|png);base64,[A-Za-z0-9+/=]+$/;
+
+function sanitizeLook(look) {
+  const clean = { clothes: 'camo', face: null };
+  if (!look || typeof look !== 'object') return clean;
+  if (typeof look.clothes === 'string' && HEX_COLOUR.test(look.clothes)) {
+    clean.clothes = look.clothes.toLowerCase();
+  }
+  if (
+    typeof look.face === 'string' &&
+    look.face.length <= MAX_FACE_CHARS &&
+    FACE_PREFIX.test(look.face)
+  ) {
+    clean.face = look.face;
+  }
+  return clean;
+}
+
 const server = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end('STEALTH multiplayer server online');
 });
 
-const wss = new WebSocket.Server({ server });
+const wss = new WebSocket.Server({ server, maxPayload: 256 * 1024 });
 
 const rooms = new Map();
 const queues = {
@@ -142,6 +162,17 @@ function playerData(player) {
   };
 }
 
+// Looks are sent once per match (not in every state tick) to keep traffic small.
+function sendLooks(room) {
+  broadcast(room, {
+    type: 'looks',
+    players: room.players.map(p => ({
+      id: p.id,
+      look: p.look
+    }))
+  });
+}
+
 function sendState(room) {
   broadcast(room, {
     type: 'state',
@@ -163,6 +194,7 @@ function createRoom(mode, players) {
     const player = {
       id: ws.playerId,
       name: ws.playerName || 'PLAYER',
+      look: ws.look || sanitizeLook(null),
       ws,
       x: spawn.x,
       y: spawn.y,
@@ -197,6 +229,7 @@ function createRoom(mode, players) {
     });
   }
 
+  sendLooks(room);
   sendState(room);
 
   console.log(
@@ -475,6 +508,7 @@ function leaveRoom(ws) {
 wss.on('connection', ws => {
   ws.playerId = makeId();
   ws.playerName = 'PLAYER';
+  ws.look = sanitizeLook(null);
   ws.roomId = null;
   ws.queued = false;
 
@@ -498,6 +532,9 @@ wss.on('connection', ws => {
       if (typeof msg.name === 'string') {
         ws.playerName = msg.name.slice(0, 16);
       }
+
+      // Look is validated here, before it can reach any other player.
+      ws.look = sanitizeLook(msg.look);
 
       joinQueue(ws, msg.mode);
       return;
