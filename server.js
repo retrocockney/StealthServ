@@ -9,6 +9,7 @@ const FFA_MAX = 8;
 const SPAWN_RADIUS = 58;
 const RESPAWN_DELAY = 2500;
 const FFA_WAIT = 8000;
+const MATCH_MS = 5 * 60 * 1000; // every match lasts 5 minutes
 
 // Look limits: clothes colour must be #rrggbb or "camo"; face must be a small JPEG/PNG data URL.
 const MAX_FACE_CHARS = 140000; // about 100 KB of base64
@@ -216,6 +217,14 @@ function createRoom(mode, players) {
 
   rooms.set(room.id, room);
 
+  // After 5 minutes, the player with the most kills wins (a tie is a draw).
+  room.timer = setTimeout(() => {
+    if (room.over) return;
+    const ranked = [...room.players].sort((a, b) => b.kills - a.kills);
+    const tie = ranked.length > 1 && ranked[0].kills === ranked[1].kills;
+    finishMatch(room, tie ? null : ranked[0]);
+  }, MATCH_MS);
+
   for (const player of room.players) {
     send(player.ws, {
       type: 'matchFound',
@@ -314,6 +323,7 @@ function finishMatch(room, winner) {
   if (room.over) return;
 
   room.over = true;
+  clearTimeout(room.timer);
 
   broadcast(room, {
     type: 'matchOver',
