@@ -9,7 +9,12 @@ const FFA_MAX = 8;
 const SPAWN_RADIUS = 58;
 const RESPAWN_DELAY = 2500;
 const FFA_WAIT = 8000;
-const MATCH_MS = 5 * 60 * 1000; // every match lasts 5 minutes
+const MATCH_MS = 5 * 60 * 1000; // default match length (queued matches)
+
+// Custom room options
+const CODE_RE = /^[A-Z0-9]{4,8}$/;
+const LOADOUTS = ['pistol', 'knife', 'sniper'];
+const MINUTES = [3, 5, 10];
 
 // Look limits: clothes colour must be #rrggbb or "camo"; face must be a small JPEG/PNG data URL.
 const MAX_FACE_CHARS = 140000; // about 100 KB of base64
@@ -32,6 +37,14 @@ function sanitizeLook(look) {
   return clean;
 }
 
+function sanitizeSettings(raw) {
+  const s = raw || {};
+  const minutes = MINUTES.includes(Number(s.minutes)) ? Number(s.minutes) : 5;
+  const maxPlayers = Math.min(8, Math.max(2, parseInt(s.maxPlayers, 10) || 8));
+  const loadout = LOADOUTS.includes(s.loadout) ? s.loadout : 'pistol';
+  return { minutes, maxPlayers, loadout };
+}
+
 const server = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end('STEALTH multiplayer server online');
@@ -39,7 +52,8 @@ const server = http.createServer((req, res) => {
 
 const wss = new WebSocket.Server({ server, maxPayload: 256 * 1024 });
 
-const rooms = new Map();
+const rooms = new Map();          // running matches
+const customRooms = new Map();    // custom rooms waiting for the host to start
 const queues = {
   duel: [],
   ffa: []
@@ -61,6 +75,13 @@ function broadcast(room, data) {
 
 function makeId() {
   return crypto.randomBytes(8).toString('hex');
+}
+
+function applyPlayerInfo(ws, msg) {
+  if (typeof msg.name === 'string') {
+    ws.playerName = msg.name.slice(0, 16) || 'PLAYER';
+  }
+  ws.look = sanitizeLook(msg.look);
 }
 
 function getSpawn(mode, index, total) {
@@ -181,12 +202,14 @@ function sendState(room) {
   });
 }
 
-function createRoom(mode, players) {
+function createRoom(mode, players, opts = {}) {
   const room = {
     id: makeId(),
     mode,
     players: [],
-    over: false
+    over: false,
+    matchMs: opts.matchMs || MATCH_MS,
+    loadout: opts.loadout || null
   };
 
   players.forEach((ws, index) => {
@@ -217,13 +240,13 @@ function createRoom(mode, players) {
 
   rooms.set(room.id, room);
 
-  // After 5 minutes, the player with the most kills wins (a tie is a draw).
+  // When time runs out, the player with the most kills wins (a tie is a draw).
   room.timer = setTimeout(() => {
     if (room.over) return;
     const ranked = [...room.players].sort((a, b) => b.kills - a.kills);
     const tie = ranked.length > 1 && ranked[0].kills === ranked[1].kills;
     finishMatch(room, tie ? null : ranked[0]);
-  }, MATCH_MS);
+  }, room.matchMs);
 
   for (const player of room.players) {
     send(player.ws, {
@@ -234,7 +257,9 @@ function createRoom(mode, players) {
       x: player.x,
       y: player.y,
       z: player.z,
-      yaw: player.yaw
+      yaw: player.yaw,
+      matchMs: room.matchMs,
+      loadout: room.loadout
     });
   }
 
@@ -296,8 +321,8 @@ function joinQueue(ws, mode) {
     return;
   }
 
-  if (ws.roomId) {
-    send(ws, { type: 'error', message: 'You are already in a match.' });
+  if (ws.roomId || ws.customCode) {
+    send(ws, { type: 'error', message: 'You are already in a match or room.' });
     return;
   }
 
@@ -316,6 +341,136 @@ function joinQueue(ws, mode) {
     startDuelQueue();
   } else {
     scheduleFFA();
+  }
+}
+
+// ---- Custom rooms ----
+
+function updateCustomRoom(room) {
+  for (const m of room.members) {
+    send(m, {
+      type: 'roomUpdate',
+      code: room.code,
+      count: room.members.length,
+      max: room.settings.maxPlayers
+    });
+  }
+}
+
+function createCustom(ws, msg) {
+  const code = String(msg.code || '').toUpperCase().trim();
+
+  if (!CODE_RE.test(code)) {
+    send(ws, { type: 'error', message: 'Room code must be 4 to 8 letters or numbers.' });
+    return;
+  }
+  if (customRooms.has(code)) {
+    send(ws, { type: 'error', message: 'That room code is already in use.' });
+    return;
+  }
+  if (ws.roomId || ws.customCode) {
+    send(ws, { type: 'error', message: 'Leave your current match or room first.' });
+    return;
+  }
+
+  removeFromQueues(ws);
+  applyPlayerInfo(ws, msg);
+
+  const settings = sanitizeSettings(msg.settings);
+  const room = { code, settings, host: ws, members: [ws] };
+
+  customRooms.set(code, room);
+  ws.customCode = code;
+
+  send(ws, {
+    type: 'roomJoined',
+    code,
+    isHost: true,
+    settings,
+    count: 1,
+    max: settings.maxPlayers
+  });
+}
+
+function joinCustom(ws, msg) {
+  const code = String(msg.code || '').toUpperCase().trim();
+  const room = customRooms.get(code);
+
+  if (!room) {
+    send(ws, { type: 'error', message: 'No room with that code.' });
+    return;
+  }
+  if (ws.roomId || ws.customCode) {
+    send(ws, { type: 'error', message: 'Leave your current match or room first.' });
+    return;
+  }
+  if (room.members.length >= room.settings.maxPlayers) {
+    send(ws, { type: 'error', message: 'That room is full.' });
+    return;
+  }
+
+  removeFromQueues(ws);
+  applyPlayerInfo(ws, msg);
+
+  room.members.push(ws);
+  ws.customCode = code;
+
+  send(ws, {
+    type: 'roomJoined',
+    code,
+    isHost: false,
+    settings: room.settings,
+    count: room.members.length,
+    max: room.settings.maxPlayers
+  });
+
+  updateCustomRoom(room);
+}
+
+function startCustom(ws) {
+  const room = customRooms.get(ws.customCode);
+
+  if (!room || room.host !== ws) {
+    send(ws, { type: 'error', message: 'Only the host can start the match.' });
+    return;
+  }
+  if (room.members.length < 2) {
+    send(ws, { type: 'error', message: 'You need at least 2 players to start.' });
+    return;
+  }
+
+  customRooms.delete(room.code);
+
+  const members = room.members;
+  for (const m of members) m.customCode = null;
+
+  createRoom('custom', members, {
+    matchMs: room.settings.minutes * 60 * 1000,
+    loadout: room.settings.loadout
+  });
+}
+
+function leaveCustom(ws) {
+  const code = ws.customCode;
+  if (!code) return;
+
+  ws.customCode = null;
+
+  const room = customRooms.get(code);
+  if (!room) return;
+
+  if (room.host === ws) {
+    // Host left: close the room and send everyone back to the menu.
+    for (const m of room.members) {
+      if (m === ws) continue;
+      m.customCode = null;
+      send(m, { type: 'error', message: 'The host left the room.' });
+      send(m, { type: 'returnToMenu' });
+    }
+    customRooms.delete(code);
+  } else {
+    room.members = room.members.filter(m => m !== ws);
+    updateCustomRoom(room);
   }
 }
 
@@ -520,6 +675,7 @@ wss.on('connection', ws => {
   ws.playerName = 'PLAYER';
   ws.look = sanitizeLook(null);
   ws.roomId = null;
+  ws.customCode = null;
   ws.queued = false;
 
   send(ws, {
@@ -539,19 +695,29 @@ wss.on('connection', ws => {
     if (!msg || typeof msg.type !== 'string') return;
 
     if (msg.type === 'join') {
-      if (typeof msg.name === 'string') {
-        ws.playerName = msg.name.slice(0, 16);
-      }
-
-      // Look is validated here, before it can reach any other player.
-      ws.look = sanitizeLook(msg.look);
-
+      applyPlayerInfo(ws, msg);
       joinQueue(ws, msg.mode);
+      return;
+    }
+
+    if (msg.type === 'createRoom') {
+      createCustom(ws, msg);
+      return;
+    }
+
+    if (msg.type === 'joinRoom') {
+      joinCustom(ws, msg);
+      return;
+    }
+
+    if (msg.type === 'startRoom') {
+      startCustom(ws);
       return;
     }
 
     if (msg.type === 'leaveQueue') {
       removeFromQueues(ws);
+      leaveCustom(ws);
       send(ws, { type: 'returnToMenu' });
       return;
     }
@@ -586,11 +752,13 @@ wss.on('connection', ws => {
 
   ws.on('close', () => {
     removeFromQueues(ws);
+    leaveCustom(ws);
     leaveRoom(ws);
   });
 
   ws.on('error', () => {
     removeFromQueues(ws);
+    leaveCustom(ws);
     leaveRoom(ws);
   });
 });
