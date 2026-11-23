@@ -6,10 +6,16 @@ const PORT = process.env.PORT || 3000;
 
 const WIN_KILLS = 10;
 const FFA_MAX = 8;
-const SPAWN_RADIUS = 58;
 const RESPAWN_DELAY = 2500;
 const FFA_WAIT = 8000;
 const MATCH_MS = 5 * 60 * 1000; // default match length (queued matches)
+
+// Each map has its own boundary (players are clamped inside it) and spawn radius.
+const MAPS = {
+  woodland: { bound: 120, spawnR: 58 },
+  mini:     { bound: 40,  spawnR: 30 }
+};
+const MAP_IDS = Object.keys(MAPS);
 
 // Custom room options
 const CODE_RE = /^[A-Z0-9]{4,8}$/;
@@ -20,6 +26,10 @@ const MINUTES = [3, 5, 10];
 const MAX_FACE_CHARS = 140000; // about 100 KB of base64
 const HEX_COLOUR = /^#[0-9a-fA-F]{6}$/;
 const FACE_PREFIX = /^data:image\/(jpeg|png);base64,[A-Za-z0-9+/=]+$/;
+
+function sanitizeMap(m) {
+  return MAP_IDS.includes(m) ? m : 'woodland';
+}
 
 function sanitizeLook(look) {
   const clean = { clothes: 'camo', face: null };
@@ -42,7 +52,8 @@ function sanitizeSettings(raw) {
   const minutes = MINUTES.includes(Number(s.minutes)) ? Number(s.minutes) : 5;
   const maxPlayers = Math.min(8, Math.max(2, parseInt(s.maxPlayers, 10) || 8));
   const loadout = LOADOUTS.includes(s.loadout) ? s.loadout : 'pistol';
-  return { minutes, maxPlayers, loadout };
+  const map = sanitizeMap(s.map);
+  return { minutes, maxPlayers, loadout, map };
 }
 
 const server = http.createServer((req, res) => {
@@ -54,12 +65,13 @@ const wss = new WebSocket.Server({ server, maxPayload: 256 * 1024 });
 
 const rooms = new Map();          // running matches
 const customRooms = new Map();    // custom rooms waiting for the host to start
-const queues = {
-  duel: [],
-  ffa: []
-};
 
-let ffaTimer = null;
+// Queues are split by mode and map, so players only meet on the map they chose.
+const queues = {};
+const ffaTimers = {};
+for (const mode of ['duel', 'ffa']) {
+  for (const map of MAP_IDS) queues[mode + ':' + map] = [];
+}
 
 function send(ws, data) {
   if (ws && ws.readyState === WebSocket.OPEN) {
@@ -84,9 +96,16 @@ function applyPlayerInfo(ws, msg) {
   ws.look = sanitizeLook(msg.look);
 }
 
-function getSpawn(mode, index, total) {
+function clampToMap(map, v) {
+  const b = MAPS[map].bound;
+  return Math.max(-b, Math.min(b, v));
+}
+
+function getSpawn(mode, map, index, total) {
+  const R = MAPS[map].spawnR;
+
   if (mode === 'duel') {
-    const x = index === 0 ? -SPAWN_RADIUS : SPAWN_RADIUS;
+    const x = index === 0 ? -R : R;
 
     return {
       x,
@@ -98,8 +117,8 @@ function getSpawn(mode, index, total) {
 
   const angle = (Math.PI * 2 * index / total) - Math.PI / 2;
 
-  const x = Math.cos(angle) * SPAWN_RADIUS;
-  const z = Math.sin(angle) * SPAWN_RADIUS;
+  const x = Math.cos(angle) * R;
+  const z = Math.sin(angle) * R;
 
   return {
     x,
@@ -110,6 +129,8 @@ function getSpawn(mode, index, total) {
 }
 
 function getRespawn(room, player) {
+  const R = MAPS[room.map].spawnR;
+
   const enemies = room.players.filter(p =>
     p.id !== player.id && !p.dead
   );
@@ -118,10 +139,10 @@ function getRespawn(room, player) {
     const enemy = enemies[0];
 
     if (!enemy) {
-      return getSpawn('duel', player.spawnIndex, 2);
+      return getSpawn('duel', room.map, player.spawnIndex, 2);
     }
 
-    const x = enemy.x >= 0 ? -SPAWN_RADIUS : SPAWN_RADIUS;
+    const x = enemy.x >= 0 ? -R : R;
 
     return {
       x,
@@ -136,17 +157,13 @@ function getRespawn(room, player) {
 
   for (let i = 0; i < 48; i++) {
     const angle = Math.random() * Math.PI * 2;
-    const x = Math.cos(angle) * SPAWN_RADIUS;
-    const z = Math.sin(angle) * SPAWN_RADIUS;
+    const x = Math.cos(angle) * R;
+    const z = Math.sin(angle) * R;
 
     let nearest = Infinity;
 
     for (const enemy of enemies) {
-      const distance = Math.hypot(
-        enemy.x - x,
-        enemy.z - z
-      );
-
+      const distance = Math.hypot(enemy.x - x, enemy.z - z);
       nearest = Math.min(nearest, distance);
     }
 
@@ -157,7 +174,7 @@ function getRespawn(room, player) {
   }
 
   if (!best) {
-    best = getSpawn('ffa', player.spawnIndex, room.players.length);
+    best = getSpawn('ffa', room.map, player.spawnIndex, room.players.length);
   }
 
   const enemy = enemies[0];
@@ -203,9 +220,12 @@ function sendState(room) {
 }
 
 function createRoom(mode, players, opts = {}) {
+  const map = sanitizeMap(opts.map);
+
   const room = {
     id: makeId(),
     mode,
+    map,
     players: [],
     over: false,
     matchMs: opts.matchMs || MATCH_MS,
@@ -213,7 +233,7 @@ function createRoom(mode, players, opts = {}) {
   };
 
   players.forEach((ws, index) => {
-    const spawn = getSpawn(mode, index, players.length);
+    const spawn = getSpawn(mode, map, index, players.length);
 
     const player = {
       id: ws.playerId,
@@ -254,6 +274,7 @@ function createRoom(mode, players, opts = {}) {
       id: player.id,
       roomId: room.id,
       mode,
+      map,
       x: player.x,
       y: player.y,
       z: player.z,
@@ -267,55 +288,58 @@ function createRoom(mode, players, opts = {}) {
   sendState(room);
 
   console.log(
-    `Room ${room.id} started: ${mode}, ${room.players.length} real players`
+    `Room ${room.id} started: ${mode} on ${map}, ${room.players.length} real players`
   );
 }
 
-function startDuelQueue() {
-  while (queues.duel.length >= 2) {
-    const players = queues.duel.splice(0, 2);
-    createRoom('duel', players);
+function startDuelQueue(map) {
+  const q = queues['duel:' + map];
+  while (q.length >= 2) {
+    const players = q.splice(0, 2);
+    createRoom('duel', players, { map });
   }
 }
 
-function startFFAQueue() {
-  if (ffaTimer) {
-    clearTimeout(ffaTimer);
-    ffaTimer = null;
+function startFFAQueue(map) {
+  if (ffaTimers[map]) {
+    clearTimeout(ffaTimers[map]);
+    ffaTimers[map] = null;
   }
 
-  if (queues.ffa.length < 2) return;
+  const q = queues['ffa:' + map];
+  if (q.length < 2) return;
 
-  const players = queues.ffa.splice(0, FFA_MAX);
-  createRoom('ffa', players);
+  const players = q.splice(0, FFA_MAX);
+  createRoom('ffa', players, { map });
 
-  if (queues.ffa.length >= 2) {
-    scheduleFFA();
+  if (q.length >= 2) {
+    scheduleFFA(map);
   }
 }
 
-function scheduleFFA() {
-  if (ffaTimer || queues.ffa.length < 2) return;
+function scheduleFFA(map) {
+  const q = queues['ffa:' + map];
+  if (ffaTimers[map] || q.length < 2) return;
 
-  ffaTimer = setTimeout(() => {
-    ffaTimer = null;
-    startFFAQueue();
+  ffaTimers[map] = setTimeout(() => {
+    ffaTimers[map] = null;
+    startFFAQueue(map);
   }, FFA_WAIT);
 }
 
 function removeFromQueues(ws) {
-  for (const mode of ['duel', 'ffa']) {
-    const index = queues[mode].indexOf(ws);
+  for (const key of Object.keys(queues)) {
+    const index = queues[key].indexOf(ws);
 
     if (index !== -1) {
-      queues[mode].splice(index, 1);
+      queues[key].splice(index, 1);
     }
   }
 
   ws.queued = false;
 }
 
-function joinQueue(ws, mode) {
+function joinQueue(ws, mode, map) {
   if (mode !== 'duel' && mode !== 'ffa') {
     send(ws, { type: 'error', message: 'Invalid game mode.' });
     return;
@@ -326,21 +350,24 @@ function joinQueue(ws, mode) {
     return;
   }
 
+  const useMap = sanitizeMap(map);
+
   removeFromQueues(ws);
 
   ws.queued = true;
-  queues[mode].push(ws);
+  queues[mode + ':' + useMap].push(ws);
 
   send(ws, {
     type: 'queued',
     mode,
+    map: useMap,
     message: 'Waiting for real players.'
   });
 
   if (mode === 'duel') {
-    startDuelQueue();
+    startDuelQueue(useMap);
   } else {
-    scheduleFFA();
+    scheduleFFA(useMap);
   }
 }
 
@@ -446,7 +473,8 @@ function startCustom(ws) {
 
   createRoom('custom', members, {
     matchMs: room.settings.minutes * 60 * 1000,
-    loadout: room.settings.loadout
+    loadout: room.settings.loadout,
+    map: room.settings.map
   });
 }
 
@@ -696,7 +724,7 @@ wss.on('connection', ws => {
 
     if (msg.type === 'join') {
       applyPlayerInfo(ws, msg);
-      joinQueue(ws, msg.mode);
+      joinQueue(ws, msg.mode, msg.map);
       return;
     }
 
@@ -736,9 +764,9 @@ wss.on('connection', ws => {
 
       if (![x, y, z, yaw].every(Number.isFinite)) return;
 
-      player.x = Math.max(-72, Math.min(72, x));
+      player.x = clampToMap(room.map, x);
       player.y = Math.max(-10, Math.min(20, y));
-      player.z = Math.max(-72, Math.min(72, z));
+      player.z = clampToMap(room.map, z);
       player.yaw = yaw;
 
       return;
